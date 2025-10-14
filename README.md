@@ -1,18 +1,24 @@
-# Efficient-ALBEF-Alignment (EPIC)
+# Efficient Vision–Language Alignment using ALBEF and Token-Level Consistency
 
-Improving alignment efficiency in ALBEF using **Per-Image Token Consistency (EPIC)** and saliency-guided techniques.
+Improving alignment efficiency in ALBEF using **Per-Image Token Consistency (EPIC)** and saliency-guided techniques. 
+This repository combines ALBEF (Align Before Fuse) and EPIC (Per-Image Token Consistency) to develop an efficient fine-grained alignment framework for vision-language pretraining.
+Our approach introduces E-PITC, a sparse per-token alignment mechanism using saliency-guided pruning and multi-positive contrastive learning to achieve stronger grounding with reduced computation.
 
 ---
 
-## Project Summary
+## Project Overview
 
 **Goal:**  
-Enhance fine-grained alignment between text tokens and image regions in ALBEF by introducing a new pretraining objective: **EPIC (Per-Image Token Consistency)**.
+Enhance fine-grained alignment between text tokens and image regions in ALBEF by introducing a new pretraining objective: **token-level consistency** using **EPIC (Per-Image Token Consistency)**.
 
 **Key Idea:**  
 Instead of only using cross-modal MLM (CMLM), EPIC generates linguistically plausible inconsistent tokens for salient text positions and trains the model to predict, **per token**, whether it is consistent with the image.  
+- E-PITC (Efficient Per-Image Token Consistency): Fine-grained alignment with top-k token matching.
+- Saliency-Guided Token Pruning: Focus only on important visual and textual tokens.
+- Multi-Positive Contrastive Learning: Handle paraphrases and semantically similar captions.
+- Momentum Distillation: Stable and noise-resistant pretraining using EMA teacher.
 
-Benefits:  
+**Benefits:**  
 - Provides **more supervision** beyond masked tokens.  
 - Reduces **modality bias** (language alone can’t easily detect inconsistencies).  
 - Improves **token-to-region alignment**.
