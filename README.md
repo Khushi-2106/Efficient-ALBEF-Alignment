@@ -90,7 +90,7 @@ total_loss = (loss_mlm + loss_ita + loss_itm + lambda_itc * loss_itc + aux_outpu
 
 ---
 
-##Next Steps:
+## Next Steps:
 - Full pretraining run on dataset.
 
 - Ablation experiments:
