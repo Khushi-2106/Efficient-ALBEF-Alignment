@@ -80,8 +80,10 @@ class ALBEF(nn.Module):
             image_embeds_m = self.visual_encoder_m(image) 
             image_feat_m = F.normalize(self.vision_proj_m(image_embeds_m[:,0,:]),dim=-1)  
             image_feat_all = torch.cat([image_feat_m.t(),self.image_queue.clone().detach()],dim=1)                                         
-            text_output_m = self.text_encoder_m(text.input_ids, attention_mask = text.attention_mask,             
-                                                return_dict = True, mode = 'text')    
+            # text_output_m = self.text_encoder_m(text.input_ids, attention_mask = text.attention_mask,             
+            #                                     return_dict = True, mode = 'text')  
+            text_output = self.text_encoder(text['input_ids'], attention_mask=text['attention_mask'], return_dict = True, mode = 'text')
+  
             text_feat_m = F.normalize(self.text_proj_m(text_output_m.last_hidden_state[:,0,:]),dim=-1) 
             text_feat_all = torch.cat([text_feat_m.t(),self.text_queue.clone().detach()],dim=1)
 

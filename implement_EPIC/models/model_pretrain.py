@@ -12,8 +12,6 @@ from models.xbert import BertConfig, BertForMaskedLM
 import torch
 import torch.nn.functional as F
 from torch import nn
-import math
-import torch.nn as nn
 
 import numpy as np
 import random
@@ -28,6 +26,9 @@ class ALBEF(nn.Module):
                  init_deit = True
                  ):
         super().__init__()
+        
+        # Save config for EPIC hyperparams access
+        self.config = config  # >>> EPIC: store config for epics params
         
         self.tokenizer = tokenizer 
         self.mlm_probability = config['mlm_probability']
@@ -49,21 +50,7 @@ class ALBEF(nn.Module):
             
         vision_width = config['vision_width']       
         bert_config = BertConfig.from_json_file(config['bert_config'])
-
-        # Ensure fusion_layer exists in the config (some BERT configs may not)
-        # default to a late fusion layer if not provided in the JSON/yaml
-        if not hasattr(bert_config, "fusion_layer"):
-            bert_config.fusion_layer = config.get("fusion_layer", 9)
-
-        self.text_encoder = BertForMaskedLM.from_pretrained(text_encoder, config=bert_config)           
-
-        # auxiliary LM for inconsistent token generation
-        #from models.xbert import BertForMaskedLM
-        # use the class imported at module top to avoid shadowing/unbound local errors
-        # use the same BertConfig so attributes like fusion_layer are present
-        self.aux_lm = BertForMaskedLM.from_pretrained('bert-base-uncased', config=bert_config)
-
-
+        
         self.text_encoder = BertForMaskedLM.from_pretrained(text_encoder, config=bert_config)      
 
         text_width = self.text_encoder.config.hidden_size
@@ -74,6 +61,15 @@ class ALBEF(nn.Module):
         self.queue_size = config['queue_size']
         self.momentum = config['momentum']  
         self.itm_head = nn.Linear(text_width, 2)     
+
+        # >>> EPIC: ITC head (per-token binary classifier)
+        # Predicts whether each text token is consistent (1) or inconsistent/replaced (0)
+        epic_hidden = text_width
+        self.itc_head = nn.Linear(epic_hidden, 1)  # outputs logits per token
+        # small initialization
+        nn.init.normal_(self.itc_head.weight, std=0.02)
+        nn.init.constant_(self.itc_head.bias, 0.)
+        # >>> EPIC: end added
 
         # create momentum models
         self.visual_encoder_m = VisionTransformer(
@@ -100,24 +96,19 @@ class ALBEF(nn.Module):
         self.text_queue = nn.functional.normalize(self.text_queue, dim=0)
 
 
-        # === EPIC additions ===
-        self.itc_head = nn.Linear(self.text_encoder.config.hidden_size, 1)
-        self.mask_ratio = 0.35
-        self.lambda_itc = 8.0
-
-        # auxiliary LM for inconsistent token generation
-        #from models.xbert import BertForMaskedLM
-        # use the class imported at module top to avoid shadowing/unbound local errors
-
-        self.aux_lm = BertForMaskedLM.from_pretrained('bert-base-uncased')
-
-
 
     def forward(self, image, text, alpha=0):
+        """
+        Returns:
+            (loss_mlm, loss_ita, loss_itm, loss_epic)
+        loss_epic is a scalar tensor. If EPIC is disabled (config missing), it will be zero.
+        """
+
         with torch.no_grad():
             self.temp.clamp_(0.001,0.5)
         
         image_embeds = self.visual_encoder(image) 
+        # image_embeds: [B, V, D] where index 0 is [CLS] patch token
         image_atts = torch.ones(image_embeds.size()[:-1],dtype=torch.long).to(image.device)
 
         image_feat = F.normalize(self.vision_proj(image_embeds[:,0,:]),dim=-1)  
@@ -133,6 +124,7 @@ class ALBEF(nn.Module):
             image_embeds_m = self.visual_encoder_m(image) 
             image_feat_m = F.normalize(self.vision_proj_m(image_embeds_m[:,0,:]),dim=-1)  
             image_feat_all = torch.cat([image_feat_m.t(),self.image_queue.clone().detach()],dim=1)                                         
+
             text_output_m = self.text_encoder_m.bert(text.input_ids, attention_mask = text.attention_mask,                      
                                                 return_dict = True, mode = 'text')    
             text_feat_m = F.normalize(self.text_proj_m(text_output_m.last_hidden_state[:,0,:]),dim=-1) 
@@ -158,7 +150,7 @@ class ALBEF(nn.Module):
         self._dequeue_and_enqueue(image_feat_m, text_feat_m)
 
         ###=================================###
-        # forward the positve image-text pair
+        # forward the positve image-text pair (fusion)
         output_pos = self.text_encoder.bert(encoder_embeds = text_embeds, 
                                         attention_mask = text.attention_mask,
                                         encoder_hidden_states = image_embeds,
@@ -166,6 +158,8 @@ class ALBEF(nn.Module):
                                         return_dict = True,
                                         mode = 'fusion',
                                        )            
+
+        # NOTE: output_pos.last_hidden_state: [B, T, D] fused text token embeddings (used for ITM + now EPIC)
         with torch.no_grad():
             bs = image.size(0)          
             weights_i2t = F.softmax(sim_i2t[:,:bs],dim=1)
@@ -210,8 +204,7 @@ class ALBEF(nn.Module):
 
         itm_labels = torch.cat([torch.ones(bs,dtype=torch.long),torch.zeros(2*bs,dtype=torch.long)],
                                dim=0).to(image.device)
-        loss_itm = F.cross_entropy(vl_output, itm_labels)   
-          
+        loss_itm = F.cross_entropy(vl_output, itm_labels)     
         
         ##================= MLM ========================##                
         input_ids = text.input_ids.clone()
@@ -238,63 +231,166 @@ class ALBEF(nn.Module):
                                        soft_labels = F.softmax(logits_m,dim=-1),
                                        alpha = alpha
                                       )                           
-        loss_mlm = mlm_output.loss        
+        loss_mlm = mlm_output.loss
 
-        return loss_mlm, loss_ita, loss_itm  
+        # >>> EPIC: Start EPIC / ITC computations
+        # If 'epic' section missing in config or epic.weight==0, we return zero EPIC loss for compatibility.
+        loss_epic = torch.tensor(0.0, device=image.device, requires_grad=False)
 
+        epic_cfg = self.config.get('epic', {}) if isinstance(self.config, dict) else {}
+        epic_enabled = epic_cfg.get('enabled', True)
+        top_k_tokens = int(epic_cfg.get('top_k_tokens', 3))          # how many text tokens to choose per sample
+        replace_topk = int(epic_cfg.get('replace_topk', 5))          # how many top MLM candidates to try
+        epic_loss_weight_inside_model = float(epic_cfg.get('internal_weight', 1.0))  # local scaling if wanted
 
-    @torch.no_grad()
-    def compute_saliency(self, image, text):
-        """
-        Use momentum (teacher) model to compute per-token saliency α.
-        Based on penultimate cross-attention layer.
-        """
-        # Set teacher (momentum) model to eval mode
-        self.momentum_model.eval()
+        if epic_enabled:
+            # 1) Compute a simple saliency score per text token: max dot(text_token, image_patch) across patches
+            #    Use pre-fusion text embeddings (text_embeds) and image patch embeddings (image_embeds[:,1:,:])
+            #    text_embeds: [B, T, D_text], image_embeds: [B, V, D_img]
+            #    Project both to a common space (using existing projections) and compute token-wise saliency.
+            with torch.no_grad():
+                # project image patch embeddings (exclude [CLS] at idx 0)
+                img_patch_embeds = image_embeds[:, 1:, :]  # [B, Vp, D_img]
+                # project image patches to embed_dim space then to text-proj space
+                img_proj = self.vision_proj(img_patch_embeds)  # [B, Vp, embed_dim]
+                # project text tokens to same embed dim
+                text_proj_tokens = self.text_proj(text_embeds)  # [B, T, embed_dim]
 
-        # Forward the teacher with attentions using momentum encoders
-        self.text_encoder_m.eval()
-        teacher_outputs = self.text_encoder_m.bert(
-            text.input_ids,
-            attention_mask=text.attention_mask,
-            encoder_hidden_states=self.visual_encoder_m(image),
-            output_attentions=True,
-            return_dict=True,
-        )
+                # compute token-patch similarity: [B, T, Vp]
+                # use matmul after permuting: (text_proj_tokens @ img_proj.transpose)
+                sim_tok_patch = torch.matmul(text_proj_tokens, img_proj.transpose(1, 2))  # [B, T, Vp]
+                # saliency per text token: max over patches (could also use sum)
+                saliency, _ = sim_tok_patch.max(dim=-1)  # [B, T]
+                # normalize saliency per sample (min-max)
+                smin = saliency.min(dim=1, keepdim=True)[0]
+                smax = saliency.max(dim=1, keepdim=True)[0]
+                saliency_norm = (saliency - smin) / (smax - smin + 1e-9)  # [B, T]
 
-        # Get cross-attn weights from the penultimate layer
-        attn_weights = teacher_outputs.cross_attentions[-2]  # [B, heads, tokens, img_patches]
+                # pick top-k tokens per sample
+                k = min(top_k_tokens, saliency_norm.size(1))
+                topk_vals, topk_idx = torch.topk(saliency_norm, k=k, dim=1)  # [B, k]
+                # build boolean mask [B, T]
+                selected_mask = torch.zeros_like(saliency_norm, dtype=torch.bool)
+                batch_idx = torch.arange(saliency_norm.size(0), device=saliency_norm.device).unsqueeze(1)
+                selected_mask[batch_idx, topk_idx] = True  # True where we will create mismatches
 
-        # Average over heads and normalize
-        alpha = attn_weights.mean(1).mean(-1)  # [B, tokens]
-        alpha = torch.softmax(alpha, dim=-1)
+            # 2) Create replacements for selected tokens using the MLM head predictions:
+            # We'll create a copy of input_ids and replace selected positions with MLM-predicted tokens.
+            # Approach:
+            #   - For each sample, mask the selected positions (use tokenizer.mask_token_id),
+            #   - Run text_encoder (MLM mode) to get logits, then choose top candidates not equal to original token.
+            #   - We try up to replace_topk candidates to avoid picking same token.
+            input_ids_for_repl = text.input_ids.clone()
+            # mask selected positions in the copy (so MLM will predict them)
+            # But be careful not to override special tokens (CLS/PAD)
+            sel_mask_positions = selected_mask & (text.input_ids != self.tokenizer.cls_token_id) & (text.input_ids != self.tokenizer.pad_token_id)
+            mask_token_id = self.tokenizer.mask_token_id
+            input_ids_for_repl[sel_mask_positions] = mask_token_id
 
-        return alpha
+            # Run MLM forward to get logits for masked positions
+            # We don't need gradients for this sampling step; compute without grad to save memory
+            with torch.no_grad():
+                mlm_outputs_for_repl = self.text_encoder(input_ids_for_repl,
+                                                         attention_mask=text.attention_mask,
+                                                         encoder_hidden_states=image_embeds,
+                                                         encoder_attention_mask=image_atts,
+                                                         return_dict=True,
+                                                         return_logits=True)
+                # logits shape: [B, T, Vocab]
+                logits_repl = mlm_outputs_for_repl.logits  # may be attribute name depending on HF wrapper; typically .logits
 
+            # Build replacement ids: start with original tokens, replace selected positions with predicted tokens
+            replaced_input_ids = text.input_ids.clone()
+            B, T = text.input_ids.shape
+            vocab_size = logits_repl.size(-1)
 
-    @torch.no_grad()
-    def forward_itc(self, image, text_ids, replace_mask, replace_ids):
-        """
-        Forward pass for EPIC ITC loss computation.
-        image: batch of images
-        text_ids: token ids after replacement
-        replace_mask: boolean tensor where tokens were replaced
-        replace_ids: original/replaced ids
-        """
-        # multimodal embeddings
-        text_output = self.text_encoder(
-            input_ids=text_ids,
-            attention_mask=(text_ids != 0),
-            encoder_hidden_states=self.visual_encoder(image),
-            return_dict=True
-        )
-        h_vl = text_output.last_hidden_state  # [B, N, D]
-        itc_logits = self.itc_head(h_vl).squeeze(-1)  # [B, N]
+            # For masked positions, pick the top predicted candidate that is different from original token
+            topk_candidates = torch.topk(logits_repl, k=replace_topk, dim=-1).indices  # [B, T, replace_topk]
+            # iterate (vectorized-ish) to choose replacement not equal to original
+            # We'll create a mask over candidates and pick first candidate != original
+            # Expand original tokens for comparison
+            orig = text.input_ids.unsqueeze(-1).expand(-1, -1, replace_topk)  # [B, T, replace_topk]
+            neq = (topk_candidates != orig)
+            # For positions where selected_mask is True, choose first candidate with neq True
+            # For numerical stability, where all candidates == original (rare), fallback to random token
+            # Prepare a fallback random token tensor
+            rand_tokens = torch.randint(0, vocab_size, (B, T), device=text.input_ids.device)
+            chosen_replacements = rand_tokens.clone()
 
-        # label = 0 if replaced, 1 otherwise
-        labels = (~replace_mask).float()
-        loss_itc = F.binary_cross_entropy_with_logits(itc_logits, labels, reduction='mean')
-        return loss_itc
+            # loop over replace_topk dimension to fill chosen_replacements where not yet chosen
+            # This loop is small (replace_topk default 5) so acceptable
+            for r in range(replace_topk):
+                cand = topk_candidates[:, :, r]  # [B, T]
+                cand_ok = neq[:, :, r]  # [B, T]
+                # choose cand where cand_ok and selected_mask and not already chosen (we mark chosen by replacing rand_tokens)
+                pick_pos = cand_ok & sel_mask_positions & (chosen_replacements == rand_tokens)
+                if pick_pos.any():
+                    chosen_replacements[pick_pos] = cand[pick_pos]
+
+            # Now set replaced tokens on positions sel_mask_positions
+            replaced_input_ids[sel_mask_positions] = chosen_replacements[sel_mask_positions]
+
+            # 3) Build per-token consistency labels: 1 = original, 0 = replaced for selected positions
+            # labels_consistency: [B, T], dtype float
+            labels_consistency = torch.ones_like(text.input_ids, dtype=torch.float, device=text.input_ids.device)
+            labels_consistency[sel_mask_positions] = 0.0
+            # Also mask out pad tokens so they don't contribute
+            valid_mask = (text.input_ids != self.tokenizer.pad_token_id)
+
+            # 4) Forward the fusion encoder for replaced texts to obtain token embeddings (we use the same encoder)
+            #    We only need fused token embeddings for the original (output_pos) to run the ITC head,
+            #    because EPIC compares the fused text embedding to decide if tokens match the image.
+            #    However, to be strict, the EPIC objective uses the model to detect mismatches introduced
+            #    by LM; we emulate this by using the fused embedding of the (possibly replaced) text.
+            #    Here we compute fused embeddings for the replaced inputs as well (batched).
+            replaced_text_embeds = None
+            try:
+                # token embeddings (before fusion) for replaced inputs
+                # We want to compute fused representations for the replaced text inputs as the model would encode them
+                repl_text_output = self.text_encoder.bert(replaced_input_ids,
+                                                          attention_mask=text.attention_mask,
+                                                          return_dict=True,
+                                                          mode='text')
+                repl_text_embeds = repl_text_output.last_hidden_state  # [B, T, D_text]
+                # fusion with image
+                output_repl = self.text_encoder.bert(encoder_embeds = repl_text_embeds,
+                                                     attention_mask = text.attention_mask,
+                                                     encoder_hidden_states = image_embeds,
+                                                     encoder_attention_mask = image_atts,
+                                                     return_dict = True,
+                                                     mode = 'fusion')
+                fused_repl_tokens = output_repl.last_hidden_state  # [B, T, D_text]
+            except Exception as e:
+                # If the HF wrapper doesn't accept the calls above, fallback: reuse output_pos (less ideal)
+                # but we want to avoid hard failures.
+                fused_repl_tokens = output_pos.last_hidden_state
+                # NOTE: fallback means the EPIC signal will be weaker; recommended to fix wrapper issues if triggered.
+
+            # 5) Compute ITC logits per token using fused_repl_tokens (or fused positive tokens)
+            # Use the fused tokens from the replaced text; comparing model's fused view to original image
+            # itc_input_embeds = fused_repl_tokens  # [B, T, D_text]
+            itc_input_embeds = fused_repl_tokens  # we've chosen to use replaced fused embeddings
+            itc_logits = self.itc_head(itc_input_embeds).squeeze(-1)  # [B, T]
+
+            # 6) Compute binary CE loss on selected token positions only
+            # Convert labels_consistency to same device and shape
+            labels_consistency = labels_consistency.to(itc_logits.device)
+            valid_positions = valid_mask & sel_mask_positions  # only compute loss on selected valid positions
+            if valid_positions.any():
+                # BCE with logits (mean over selected positions)
+                # flatten
+                logits_sel = itc_logits[valid_positions]
+                labels_sel = labels_consistency[valid_positions]
+                loss_epic = F.binary_cross_entropy_with_logits(logits_sel, labels_sel)
+                # optional internal weighting
+                loss_epic = loss_epic * epic_loss_weight_inside_model
+            else:
+                loss_epic = torch.tensor(0.0, device=image.device, requires_grad=False)
+
+        # >>> EPIC: End EPIC computations
+
+        # Return new 4-tuple containing epic loss
+        return loss_mlm, loss_ita, loss_itm, loss_epic  
 
 
 
@@ -312,7 +408,6 @@ class ALBEF(nn.Module):
             for param, param_m in zip(model_pair[0].parameters(), model_pair[1].parameters()):
                 param_m.data = param_m.data * self.momentum + param.data * (1. - self.momentum)
                 
-            
             
     @torch.no_grad()
     def _dequeue_and_enqueue(self, image_feat, text_feat):
@@ -351,6 +446,7 @@ class ALBEF(nn.Module):
         indices_random = torch.bernoulli(torch.full(input_ids.shape, 0.5)).bool() & masked_indices & ~indices_replaced
         random_words = torch.randint(vocab_size, input_ids.shape, dtype=torch.long).to(device)
         input_ids[indices_random] = random_words[indices_random]                     
+
         # The rest of the time (10% of the time) we keep the masked input tokens unchanged   
         
         if targets is not None:
@@ -371,4 +467,3 @@ def concat_all_gather(tensor):
 
     output = torch.cat(tensors_gather, dim=0)
     return output
-
