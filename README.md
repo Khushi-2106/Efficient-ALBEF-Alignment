@@ -50,6 +50,9 @@ Di_ITC = torch.sigmoid(beta * h_i_VL)
 1 → consistent token\
 Loss weight: lambda_itc = 8
 
+- Updated Tota Loss
+L_total = L_MLM + L_ITA + L_ITM + λ_itc * L_ITC + L_aux_LM  
+
 ---
 
 ## Integration into ALBEF
@@ -71,27 +74,52 @@ Loss weight: lambda_itc = 8
 - EPIC losses added to ALBEF original losses:
 total_loss = (loss_mlm + loss_ita + loss_itm + lambda_itc * loss_itc + aux_outputs.loss  # LGEN)
 
+**This repo integrates EPIC into ALBEF with:**
+
+- Modified model_pretrain.py
+
+Added ITC head,
+Added auxiliary LM,
+Added token saliency computation
+
+- Updated pretrain.py
+
+Included EPIC forward pass, 
+Added optimizer groups,
+Integrated all losses
+
+Efficient variants: (currently working)
+
+Top-k pruning,
+Sparse token–patch alignment
+
+All changes preserve ALBEF’s original EMA-based momentum distillation pipeline.
+
 ---
 
 ## Implementation Steps
 
 - Compute saliency (teacher VLM).
+- Prune low-saliency tokens (efficiency enhancement)  - top-K pruning (currently working).
 - Mask & generate inconsistent tokens (aux LM).
-- Forward student VLM & compute ITC loss.
+- Forward student VLM & compute ITC loss, MLM loss, ITA contrastive loss, ITM matching loss, Auxiliary LM’s MLM loss.
 - Combine with original ALBEF losses.
+- Update momentum teacher via EMA.
 
 ---
 
 ## Current Progress
 
 - Modified **model_pretrain.py**: Added itc_head and aux_lm; implemented saliency extraction & EPIC forward logic.
-- Updated **pretrain.p** Integrated EPIC loss into training loop; added param groups for aux_lm & itc_head.
-- Sanity check (epic_test.py): Initialized ALBEF + EPIC components; forward pass works without errors.
+- Updated **pretrain.py** Integrated EPIC loss into training loop; added param groups for aux_lm & itc_head.
+- Sanity check (epic_test.py): Initialized ALBEF + EPIC components; forward pass working(Need more resource access).
+- Integrated token-level consistency into ALBEF
+- Updated training loop and optimizer
 
 ---
 
 ## Next Steps:
-- Full pretraining run on dataset.
+- Full pretraining run on dataset(need more resources).
 
 - Ablation experiments:
 
@@ -101,10 +129,25 @@ ITC with random corrupted tokens
 
 Full EPIC with customized changes for efficiency improvement.
 
+ALBEF + Efficient EPIC (our improvements).
+
+---
+
+## Datasets Used:
+
+- Flickr30k (full)
+
+- Reduced subset (for quick testing)
+
+- Custom caption variations (for multi-positive contrastive learning)
+
+- VisualGenome (for EPIC pretraining)
+
 ---
 
 ## References
 
 - ALBEF
 - EPIC
+- CLIP, ViLT, METER (background literature)
 
