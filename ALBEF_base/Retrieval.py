@@ -1,6 +1,6 @@
 import argparse
 import os
-import ruamel_yaml as yaml
+import yaml
 import numpy as np
 import random
 import time
@@ -224,7 +224,8 @@ def itm_eval(scores_i2t, scores_t2i, txt2img, img2txt):
 def main(args, config):
     utils.init_distributed_mode(args)    
     
-    device = torch.device(args.device)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
     # fix the seed for reproducibility
     seed = args.seed + utils.get_rank()
@@ -277,7 +278,31 @@ def main(args, config):
         print(msg)  
         
     
-    model = model.to(device)   
+    model = model.to(device)
+
+    model.eval()
+    with torch.no_grad():
+        for images, captions in val_loader:
+            # Ensure captions is a list of strings
+            if isinstance(captions, torch.Tensor):
+                captions = [str(c) for c in captions.tolist()]
+
+            text_inputs = tokenizer(
+                captions,
+                return_tensors="pt",
+                padding=True,
+                truncation=True
+            )
+
+            # Move to device
+            text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
+            images = images.to(device)
+
+            # Forward pass
+            image_features, text_features = model(images, text_inputs, alpha=0, idx=None)
+
+
+    
     
     model_without_ddp = model
     if args.distributed:
